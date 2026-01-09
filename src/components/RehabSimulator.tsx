@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * ✅ 입력 CSV (public/data/window_features_with_p.csv) 필수 컬럼:
  * group, subject, file, t0, t1, f_act, f_comp, f_inst, Z_act, Z_comp, Z_inst, p
  *
+
  * ✅ 특허 정합 핵심:
  * - EMA/slope/T_adapt는 "파일(file) 단위"로 리셋 (Target 경계에서 초기화)
  * - T_abs는 Healthy p 분포 95th percentile (옵션: fallback fixed)
