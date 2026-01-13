@@ -837,9 +837,8 @@ export default function RehabSimulator_personalized() {
               color: "#fca5a5",
             }}
           >
-            CSV를 불러오지 못했습니다. 파일이{" "}
-            <code>public/data/window_features_with_p.csv</code>에 있는지
-            확인하십시오.
+            CSV를 데이터셋을 불러오는 중입니다. {" "}
+            <code>public/data/window_features_with_p.csv</code>을 불러옵니다.
           </div>
         )}
 
