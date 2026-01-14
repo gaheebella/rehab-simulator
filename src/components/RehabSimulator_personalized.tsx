@@ -1,18 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * ✅ 입력 CSV (public/data/window_features_with_p.csv) 필수 컬럼:
+ * ✅ 입력 CSV (public/data/)
+ * - window_features_with_p_ML.csv  (p_hat, sub_tree 포함)
+ *
+ * ✅ 필수 컬럼:
  * group, subject, file, t0, t1, f_act, f_comp, f_inst, Z_act, Z_comp, Z_inst, p
  *
-
- * ✅ 특허 정합 핵심:
- * - EMA/slope/T_adapt는 "파일(file) 단위"로 리셋 (Target 경계에서 초기화)
- * - T_abs는 Healthy p 분포 95th percentile (옵션: fallback fixed)
- * - 게이팅: Normal / Adaptive / Critical
- * - Z-score 원인 분리: Assist / Constraint / Damping
- * - 채터링 방지: 히스테리시스 + 최소 유지시간
- * - 임피던스 연속 조정: margin 기반 K(t), D(t) + 원인별 보정
+ * ✅ (A안 ML 추가) 선택 컬럼:
+ * - p_hat: SVM 예측 위험도 (0~1). 있으면 p 대신 사용
+ * - sub_tree: Decision Tree 예측 SubMode ("ASSIST"|"CONSTRAINT"|"DAMPING"|"NONE"). 있으면 Z-rule 대신 사용
  */
+
+type Mode = "NORMAL" | "ADAPTIVE" | "CRITICAL";
+type SubMode = "NONE" | "ASSIST" | "CONSTRAINT" | "DAMPING";
 
 type Row = {
   group: string;
@@ -20,14 +21,28 @@ type Row = {
   file: string;
   t0: number;
   t1: number;
+
   f_act: number;
   f_comp: number;
   f_inst: number;
+
   Z_act: number;
   Z_comp: number;
   Z_inst: number;
-  p: number; // 0~1
-  idx: number; // global idx after sorting
+
+  // --- 위험도 입력 ---
+  p: number; // 실제 시뮬레이터에서 사용할 위험도(0~1). p_hat이 있으면 p_hat으로 덮어씀
+  p_raw_in: number; // CSV 원본 p
+
+  // --- (선택) ML 위험도 ---
+  p_hat: number | null; // SVM 예측 위험도(0~1), 없으면 null
+
+  p_hat_cal: number | null; // SVM 예측 위험도 보정값, 없으면 null
+
+  // --- (선택) Tree SubMode ---
+  sub_tree: SubMode | null; // Decision Tree 예측 SubMode, 없으면 null
+
+  idx: number;
 };
 
 type DerivedRow = Row & {
@@ -36,9 +51,6 @@ type DerivedRow = Row & {
   slope: number; // pEma(t)-pEma(t-1) within file
   T_adapt: number; // sigmoid(slope)
 };
-
-type Mode = "NORMAL" | "ADAPTIVE" | "CRITICAL";
-type SubMode = "NONE" | "ASSIST" | "CONSTRAINT" | "DAMPING";
 
 type PersonalThreshold = {
   T_base_user: number;
@@ -64,9 +76,19 @@ function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
 }
 
+function parseSubMode(v: unknown): SubMode | null {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim().toUpperCase();
+  if (!s) return null;
+  if (s === "NONE") return "NONE";
+  if (s === "ASSIST") return "ASSIST";
+  if (s === "CONSTRAINT") return "CONSTRAINT";
+  if (s === "DAMPING") return "DAMPING";
+  return null;
+}
+
 /**
  * CSV 파서: 기본적인 quoted field 지원(쉼표/줄바꿈 포함 가능).
- * 전처리 CSV가 표준 형태라면 충분합니다.
  */
 function parseCSV(text: string): Record<string, string>[] {
   const rows: string[][] = [];
@@ -79,7 +101,6 @@ function parseCSV(text: string): Record<string, string>[] {
     field = "";
   };
   const pushRow = () => {
-    // 빈 줄 제거
     if (cur.length === 1 && cur[0].trim() === "") {
       cur = [];
       return;
@@ -93,7 +114,6 @@ function parseCSV(text: string): Record<string, string>[] {
     const next = i + 1 < text.length ? text[i + 1] : "";
 
     if (c === '"' && inQuotes && next === '"') {
-      // escaped quote ""
       field += '"';
       i++;
       continue;
@@ -107,7 +127,6 @@ function parseCSV(text: string): Record<string, string>[] {
       continue;
     }
     if ((c === "\n" || c === "\r") && !inQuotes) {
-      // handle CRLF
       if (c === "\r" && next === "\n") i++;
       pushField();
       pushRow();
@@ -115,7 +134,6 @@ function parseCSV(text: string): Record<string, string>[] {
     }
     field += c;
   }
-  // 마지막 필드/행
   pushField();
   pushRow();
 
@@ -129,7 +147,6 @@ function parseCSV(text: string): Record<string, string>[] {
     for (let j = 0; j < header.length; j++) {
       obj[header[j]] = (cols[j] ?? "").trim();
     }
-    // 헤더가 없는 완전 빈 행 제외
     const any = Object.values(obj).some((v) => v !== "");
     if (any) out.push(obj);
   }
@@ -147,7 +164,7 @@ function percentile(sortedAsc: number[], p: number) {
 }
 
 /**
- * ✅ 특허 정합 핵심: "파일 단위 EMA 리셋" + slope 계산 + T_adapt 계산
+ * ✅ 파일 단위 EMA 리셋 + slope 계산 + T_adapt 계산
  */
 function computeDerivedPerFile(
   rows: Row[],
@@ -171,11 +188,10 @@ function computeDerivedPerFile(
     const T_base = getTBase(r);
 
     if (key !== currentKey) {
-      // 파일 경계: EMA 리셋
       currentKey = key;
       prevEma = r.p;
       prevEmaForSlope = prevEma;
-      const slope = 0; // 파일 첫 window는 slope=0
+      const slope = 0;
       const denom = 1 + Math.exp(k_s * (slope - S_mid));
       const T_adapt = T_min + (T_base - T_min) / denom;
 
@@ -183,7 +199,6 @@ function computeDerivedPerFile(
       continue;
     }
 
-    // 같은 파일 내부: EMA 갱신
     prevEma = alpha * r.p + (1 - alpha) * prevEma;
     const slope = prevEma - prevEmaForSlope;
     prevEmaForSlope = prevEma;
@@ -197,12 +212,9 @@ function computeDerivedPerFile(
   return out;
 }
 
-
 function downsampleSeries(series: number[], maxPoints: number) {
   const n = series.length;
-  if (n <= maxPoints) {
-    return series.map((v, i) => ({ i, v }));
-  }
+  if (n <= maxPoints) return series.map((v, i) => ({ i, v }));
   const step = (n - 1) / (maxPoints - 1);
   const out: { i: number; v: number }[] = [];
   for (let k = 0; k < maxPoints; k++) {
@@ -213,7 +225,10 @@ function downsampleSeries(series: number[], maxPoints: number) {
 }
 
 export default function RehabSimulator_personalized() {
-  // ===== 파라미터(명세서) =====
+  // ✅ CSV 경로를 한 곳에서 관리 (UI 표시/로딩 메시지/fetch 모두 동일)
+  const CSV_PATH = "/data/window_features_with_p_ML.csv";
+
+  // ===== 파라미터 =====
   const [alpha, setAlpha] = useState(0.3);
 
   const [k_s, setK_s] = useState(10);
@@ -221,22 +236,28 @@ export default function RehabSimulator_personalized() {
   const [T_base, setT_base] = useState(0.5);
   const [T_min, setT_min] = useState(0.3);
 
+  // (A안) ML 위험도 사용 여부: p_hat 있으면 그걸 p로 사용
+  const [useMLRisk, setUseMLRisk] = useState(true);
+
+  // (A안) Tree SubMode 사용 여부: sub_tree 있으면 그걸 사용, 없으면 Z-rule fallback
+  const [useTreeSubMode, setUseTreeSubMode] = useState(true);
+
   // 개인화(바이오마커 → 개인 기준 임계치)
   const [usePersonalThreshold, setUsePersonalThreshold] = useState(true);
   const [personalBySubject, setPersonalBySubject] = useState<
     Map<number, PersonalThreshold>
   >(new Map());
 
-  // 바이오마커→severity 가중치/매핑(파이썬 개인화 스크립트와 동일 컨셉)
+  // 바이오마커→severity 가중치/매핑
   const [w_rms, setW_rms] = useState(0.35);
   const [w_cv, setW_cv] = useState(0.35);
-  const [w_mf, setW_mf] = useState(0.20); // MF 낮을수록 위험 → -z_mf
-  const [w_active, setW_active] = useState(0.10);
+  const [w_mf, setW_mf] = useState(0.2); // MF 낮을수록 위험 → -z_mf
+  const [w_active, setW_active] = useState(0.1);
   const [a_base, setA_base] = useState(0.06);
   const [b_min, setB_min] = useState(0.04);
 
-  const T_base_bounds: [number, number] = [0.35, 0.80];
-  const T_min_bounds: [number, number] = [0.10, 0.60];
+  const T_base_bounds: [number, number] = [0.35, 0.8];
+  const T_min_bounds: [number, number] = [0.1, 0.6];
 
   // 절대 임계치: Healthy 95th 자동 + fallback fixed
   const [useHealthyPercentile, setUseHealthyPercentile] = useState(true);
@@ -246,7 +267,7 @@ export default function RehabSimulator_personalized() {
   // 파일별 초기 window 제거(옵션)
   const [dropPerFile, setDropPerFile] = useState(5);
 
-  // Z-score 임계치
+  // Z-score 임계치(규칙 fallback에만 사용)
   const [theta_act, setThetaAct] = useState(2.0);
   const [theta_comp, setThetaComp] = useState(2.0);
   const [theta_inst, setThetaInst] = useState(2.0);
@@ -279,9 +300,7 @@ export default function RehabSimulator_personalized() {
     let cancelled = false;
 
     async function loadCSV() {
-      const res = await fetch("/data/window_features_with_p.csv", {
-        cache: "no-store",
-      });
+      const res = await fetch(CSV_PATH, { cache: "no-store" });
       if (!res.ok) {
         throw new Error(`CSV 로드 실패: ${res.status} ${res.statusText}`);
       }
@@ -305,7 +324,27 @@ export default function RehabSimulator_personalized() {
           const Z_comp = toNumber(r["Z_comp"]) ?? 0;
           const Z_inst = toNumber(r["Z_inst"]) ?? 0;
 
-          const p = clamp01(toNumber(r["p"]) ?? 0);
+          // 원본 p
+          const p_raw_in = clamp01(toNumber(r["p"]) ?? 0);
+
+          // (A안) SVM 예측 위험도 p_hat (없으면 null)
+          const p_hat_val = toNumber(r["p_hat"]);
+          const p_hat = p_hat_val === null ? null : clamp01(p_hat_val);
+
+          const p_hat_cal_val = toNumber(r["p_hat_cal"]);
+          const p_hat_cal =
+            p_hat_cal_val === null ? null : clamp01(p_hat_cal_val);
+
+          // (A안) Tree 예측 SubMode (없으면 null)
+          const sub_tree = parseSubMode(r["sub_tree"]);
+
+          const p_used = useMLRisk
+            ? p_hat_cal !== null
+              ? p_hat_cal
+              : p_hat !== null
+              ? p_hat
+              : p_raw_in
+            : p_raw_in;
 
           return {
             group,
@@ -319,7 +358,13 @@ export default function RehabSimulator_personalized() {
             Z_act,
             Z_comp,
             Z_inst,
-            p,
+
+            p: p_used,
+            p_raw_in,
+            p_hat,
+            p_hat_cal,
+            sub_tree,
+
             idx: i,
           };
         })
@@ -339,7 +384,6 @@ export default function RehabSimulator_personalized() {
         kept.push(...rows.slice(dropPerFile));
       }
 
-      // 전체 정렬: 파일 단위로 묶이면서 시간 순서(t0) 기준
       kept.sort((a, b) => {
         const ka = `${a.group}::${a.subject}::${a.file}`;
         const kb = `${b.group}::${b.subject}::${b.file}`;
@@ -359,37 +403,45 @@ export default function RehabSimulator_personalized() {
 
     loadCSV().catch((e) => {
       console.error(e);
-      // 로드 실패 시 빈 상태 유지 (화면에 경고 표시는 아래에서 처리)
+      if (!cancelled) {
+        setData([]);
+        setDerived([]);
+        setIsPlaying(false);
+      }
     });
 
     return () => {
       cancelled = true;
     };
-  }, [dropPerFile]);
+  }, [CSV_PATH, dropPerFile, useMLRisk]);
 
-
-  // ✅ 바이오마커 로드(개인 임계치용): public/data/biomarkers_all_subjects.csv, activation_summary_all_subjects.csv
+  // ✅ 바이오마커 로드(개인 임계치용)
   useEffect(() => {
     let cancelled = false;
 
     async function loadBiomarkers() {
       const [resBm, resAct] = await Promise.all([
         fetch("/data/biomarkers_all_subjects.csv", { cache: "no-store" }),
-        fetch("/data/activation_summary_all_subjects.csv", { cache: "no-store" }),
+        fetch("/data/activation_summary_all_subjects.csv", {
+          cache: "no-store",
+        }),
       ]);
 
       if (!resBm.ok) {
-        throw new Error(`biomarkers CSV 로드 실패: ${resBm.status} ${resBm.statusText}`);
+        throw new Error(
+          `biomarkers CSV 로드 실패: ${resBm.status} ${resBm.statusText}`
+        );
       }
       if (!resAct.ok) {
-        throw new Error(`activation CSV 로드 실패: ${resAct.status} ${resAct.statusText}`);
+        throw new Error(
+          `activation CSV 로드 실패: ${resAct.status} ${resAct.statusText}`
+        );
       }
 
       const [txtBm, txtAct] = await Promise.all([resBm.text(), resAct.text()]);
       const bmRaw = parseCSV(txtBm);
       const actRaw = parseCSV(txtAct);
 
-      // --- biomarker subject-agg (mean) ---
       type Agg = {
         group: string;
         subject: number;
@@ -427,7 +479,6 @@ export default function RehabSimulator_personalized() {
         const rms = toNumber(r["RMS"] ?? r["rms"]);
         const cv = toNumber(r["CV"] ?? r["cv"]);
         const mf = toNumber(r["MF"] ?? r["mf"]);
-
         if (rms === null || cv === null || mf === null) continue;
 
         const a = getAgg(group, subject);
@@ -442,7 +493,9 @@ export default function RehabSimulator_personalized() {
         const subject = toNumber(r["Subject"] ?? r["subject"]) ?? null;
         if (subject === null) continue;
 
-        const ar = toNumber(r["active_ratio"] ?? r["Active_Ratio"] ?? r["activeRatio"]);
+        const ar = toNumber(
+          r["active_ratio"] ?? r["Active_Ratio"] ?? r["activeRatio"]
+        );
         if (ar === null) continue;
 
         const a = getAgg(group, subject);
@@ -450,12 +503,10 @@ export default function RehabSimulator_personalized() {
         a.n_active += 1;
       }
 
-      // Healthy 기준 통계(평균/표준편차)
       const healthy = Array.from(agg.values()).filter((a) =>
         a.group.toLowerCase().includes("healthy")
       );
 
-      // 표본 부족 시 개인화 비활성(빈 맵)
       if (healthy.length < 3) {
         if (!cancelled) setPersonalBySubject(new Map());
         return;
@@ -463,27 +514,39 @@ export default function RehabSimulator_personalized() {
 
       const toMean = (x_sum: number, n: number) => (n > 0 ? x_sum / n : NaN);
 
-      const hrms = healthy.map((a) => toMean(a.rms_sum, a.n)).filter(Number.isFinite);
-      const hcv = healthy.map((a) => toMean(a.cv_sum, a.n)).filter(Number.isFinite);
-      const hmf = healthy.map((a) => toMean(a.mf_sum, a.n)).filter(Number.isFinite);
+      const hrms = healthy
+        .map((a) => toMean(a.rms_sum, a.n))
+        .filter(Number.isFinite);
+      const hcv = healthy
+        .map((a) => toMean(a.cv_sum, a.n))
+        .filter(Number.isFinite);
+      const hmf = healthy
+        .map((a) => toMean(a.mf_sum, a.n))
+        .filter(Number.isFinite);
       const har = healthy
         .map((a) => toMean(a.active_sum, a.n_active))
         .filter(Number.isFinite);
 
-      const mean = (xs: number[]) => xs.reduce((s, v) => s + v, 0) / Math.max(1, xs.length);
+      const mean = (xs: number[]) =>
+        xs.reduce((s, v) => s + v, 0) / Math.max(1, xs.length);
       const std = (xs: number[]) => {
         if (xs.length < 2) return 1;
         const m = mean(xs);
         const v =
-          xs.reduce((s, x) => s + (x - m) * (x - m), 0) / Math.max(1, xs.length - 1);
+          xs.reduce((s, x) => s + (x - m) * (x - m), 0) /
+          Math.max(1, xs.length - 1);
         const sd = Math.sqrt(v);
         return sd > 1e-12 ? sd : 1;
       };
 
-      const mu_rms = mean(hrms), sd_rms = std(hrms);
-      const mu_cv = mean(hcv), sd_cv = std(hcv);
-      const mu_mf = mean(hmf), sd_mf = std(hmf);
-      const mu_ar = mean(har), sd_ar = std(har);
+      const mu_rms = mean(hrms),
+        sd_rms = std(hrms);
+      const mu_cv = mean(hcv),
+        sd_cv = std(hcv);
+      const mu_mf = mean(hmf),
+        sd_mf = std(hmf);
+      const mu_ar = mean(har),
+        sd_ar = std(har);
 
       const map = new Map<number, PersonalThreshold>();
 
@@ -493,9 +556,13 @@ export default function RehabSimulator_personalized() {
         const mf = toMean(a.mf_sum, a.n);
         const ar = toMean(a.active_sum, a.n_active);
 
-        if (!Number.isFinite(rms) || !Number.isFinite(cv) || !Number.isFinite(mf)) continue;
+        if (
+          !Number.isFinite(rms) ||
+          !Number.isFinite(cv) ||
+          !Number.isFinite(mf)
+        )
+          continue;
 
-        // activation_summary가 없는 경우 ar을 healthy 평균으로 대체(결측 처리)
         const ar_filled = Number.isFinite(ar) ? ar : mu_ar;
 
         const z_rms = (rms - mu_rms) / sd_rms;
@@ -503,18 +570,15 @@ export default function RehabSimulator_personalized() {
         const z_mf = (mf - mu_mf) / sd_mf;
         const z_ar = (ar_filled - mu_ar) / sd_ar;
 
-        // severity: positive => more risky (threshold down), negative => less risky (threshold up)
         const severity =
-          w_rms * z_rms + w_cv * z_cv + w_mf * (-z_mf) + w_active * z_ar;
+          w_rms * z_rms + w_cv * z_cv + w_mf * -z_mf + w_active * z_ar;
 
-        // 개인 기준 임계치 (기본값 T_base/T_min에서 이동)
         let T_base_user = T_base - a_base * severity;
         let T_min_user = T_min - b_min * severity;
 
         T_base_user = clamp(T_base_user, T_base_bounds[0], T_base_bounds[1]);
         T_min_user = clamp(T_min_user, T_min_bounds[0], T_min_bounds[1]);
 
-        // 관계 제약: T_min < T_base
         if (T_min_user >= T_base_user - 0.01) {
           T_min_user = Math.max(T_min_bounds[0], T_base_user - 0.01);
         }
@@ -529,7 +593,6 @@ export default function RehabSimulator_personalized() {
 
     loadBiomarkers().catch((e) => {
       console.error(e);
-      // 개인화 파일이 없으면 기존 T_base/T_min로 동작하도록, map은 빈 상태 유지
       if (!cancelled) setPersonalBySubject(new Map());
     });
 
@@ -538,19 +601,18 @@ export default function RehabSimulator_personalized() {
     };
   }, [T_base, T_min, w_rms, w_cv, w_mf, w_active, a_base, b_min]);
 
-
-  // T_abs 계산 (Healthy p 95th)
+  // T_abs 계산 (Healthy p 95th) — 여기서의 p는 “현재 선택된 p”(p_hat 우선)가 반영됨
   const T_abs = useMemo(() => {
     if (!useHealthyPercentile) return T_abs_fixed;
     if (data.length === 0) return T_abs_fixed;
 
     const healthyP = data
       .filter((r) => r.group.toLowerCase() === "healthy")
-      .map((r) => r.p)
+      .map((r) => r.p_raw_in)
       .filter((v) => Number.isFinite(v))
       .sort((a, b) => a - b);
 
-    if (healthyP.length < 50) return T_abs_fixed; // 표본 부족 시 고정값 사용
+    if (healthyP.length < 50) return T_abs_fixed;
     return clamp01(percentile(healthyP, T_abs_percentile));
   }, [useHealthyPercentile, T_abs_fixed, data]);
 
@@ -572,7 +634,16 @@ export default function RehabSimulator_personalized() {
     };
     const d = computeDerivedPerFile(data, alpha, k_s, S_mid, getTMin, getTBase);
     setDerived(d);
-  }, [data, alpha, k_s, S_mid, T_min, T_base, usePersonalThreshold, personalBySubject]);
+  }, [
+    data,
+    alpha,
+    k_s,
+    S_mid,
+    T_min,
+    T_base,
+    usePersonalThreshold,
+    personalBySubject,
+  ]);
 
   // 게이팅 + 임피던스 + 채터링 방지
   const gating = useMemo(() => {
@@ -603,7 +674,7 @@ export default function RehabSimulator_personalized() {
     for (let i = 0; i < derived.length; i++) {
       const r = derived[i];
 
-      // 파일 경계에서: 채터링 억제 상태(hold)도 리셋하는 게 특허 의미에 더 부합
+      // 파일 경계에서 리셋
       if (r.key !== prevKey) {
         prevKey = r.key;
         currentMode = "NORMAL";
@@ -650,24 +721,31 @@ export default function RehabSimulator_personalized() {
         }
       }
 
-      // 원인 분리(Z-score)
+      // ---- SubMode 결정 (A안) ----
+      // 1) useTreeSubMode=true && r.sub_tree가 있으면 그걸 사용
+      // 2) 없으면 기존 Z-score 규칙 fallback
       let sm: SubMode = "NONE";
-      if (r.Z_inst >= theta_inst) sm = "DAMPING";
-      else if (r.Z_comp >= theta_comp) sm = "CONSTRAINT";
-      else if (r.Z_act >= theta_act) sm = "ASSIST";
+      if (useTreeSubMode && r.sub_tree) {
+        sm = r.sub_tree;
+      } else {
+        if (r.Z_inst >= theta_inst) sm = "DAMPING";
+        else if (r.Z_comp >= theta_comp) sm = "CONSTRAINT";
+        else if (r.Z_act >= theta_act) sm = "ASSIST";
+        else sm = "NONE";
+      }
 
       // margin
       const m = pE - Ta;
       margin_arr.push(m);
 
-      // 연속 임피던스 (명세서 예)
+      // 연속 임피던스
       let Kt = K0 + gammaK * Math.max(0, m);
       let Dt = D0 + gammaD * Math.max(0, m);
       let Kguide = 0;
       let eps = epsilon0;
 
       if (currentMode === "CRITICAL") {
-        // 안전모드: 보수적으로 최소값에 가깝게 고정(시뮬레이션 표현)
+        // 안전모드: 보수적으로 제한
         Kt = Math.max(0.1, Math.min(Kt, K0));
         Dt = Math.max(0.1, Math.min(Dt, D0));
         Kguide = 0;
@@ -675,17 +753,14 @@ export default function RehabSimulator_personalized() {
         sm = "NONE";
       } else if (currentMode === "ADAPTIVE") {
         if (sm === "DAMPING") {
-          // 불안정: D 우선 증가
           Dt = Dt + guideGain * Math.max(0, m);
         } else if (sm === "CONSTRAINT") {
-          // 보상: 궤적 구속
           Kguide = guideGain * (1 + Math.max(0, m));
           eps = Math.max(
             epsilonMin,
             epsilon0 * (1 - 0.5 * clamp01(Math.max(0, m)))
           );
         } else if (sm === "ASSIST") {
-          // 과활성: K 감소(보조 증가)
           Kt = Math.max(0.1, Kt * (1 - assistKDown));
         }
       } else {
@@ -728,6 +803,7 @@ export default function RehabSimulator_personalized() {
     guideGain,
     epsilon0,
     epsilonMin,
+    useTreeSubMode,
   ]);
 
   // 재생
@@ -755,13 +831,13 @@ export default function RehabSimulator_personalized() {
   const chart = useMemo(() => {
     if (derived.length === 0) return null;
 
-    const pRaw = derived.map((r) => r.p);
+    const pUsed = derived.map((r) => r.p_raw_in);
     const pEma = derived.map((r) => r.pEma);
     const Tadapt = derived.map((r) => r.T_adapt);
 
-    const maxPoints = 2000; // 성능 보호
+    const maxPoints = 2000;
     return {
-      pRawDS: downsampleSeries(pRaw, maxPoints),
+      pUsedDS: downsampleSeries(pUsed, maxPoints),
       pEmaDS: downsampleSeries(pEma, maxPoints),
       TadaptDS: downsampleSeries(Tadapt, maxPoints),
     };
@@ -773,6 +849,7 @@ export default function RehabSimulator_personalized() {
       : m === "ADAPTIVE"
       ? "Adaptive Intervention Mode"
       : "Normal Mode";
+
   const subLabel = (s: SubMode) =>
     s === "DAMPING"
       ? "Damping Mode (D↑)"
@@ -816,14 +893,14 @@ export default function RehabSimulator_personalized() {
       >
         <div>
           <h1 style={{ margin: 0, fontSize: 28 }}>
-            Rehab Simulator (TSX, CSV Auto-Load)
+            Rehab Simulator (SVM p_hat + Tree sub_tree, rule gating kept)
           </h1>
           <div style={{ color: "#94a3b8", marginTop: 6 }}>
-            Dual Threshold (T_abs, T_adapt) + Z-score + Chattering Suppression +
-            Impedance Update
+            Dual Threshold (T_abs, T_adapt) + (optional) ML Risk p_hat +
+            (optional) Tree SubMode + Chattering Suppression + Impedance Update
           </div>
           <div style={{ color: "#94a3b8", marginTop: 6, fontSize: 13 }}>
-            CSV 경로: <code>/public/data/window_features_with_p.csv</code>
+            CSV 경로: <code>{CSV_PATH}</code>
           </div>
         </div>
 
@@ -837,8 +914,7 @@ export default function RehabSimulator_personalized() {
               color: "#fca5a5",
             }}
           >
-            CSV를 데이터셋을 불러오는 중입니다. {" "}
-            <code>public/data/window_features_with_p.csv</code>을 불러옵니다.
+            CSV를 불러오는 중입니다. <code>{CSV_PATH}</code>
           </div>
         )}
 
@@ -872,6 +948,7 @@ export default function RehabSimulator_personalized() {
               >
                 {isPlaying ? "Pause" : "Play"}
               </button>
+
               <button
                 onClick={() => {
                   setCurrentIdx(0);
@@ -888,6 +965,38 @@ export default function RehabSimulator_personalized() {
               >
                 Reset
               </button>
+
+              <label
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  color: "#e2e8f0",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={useMLRisk}
+                  onChange={(e) => setUseMLRisk(e.target.checked)}
+                />
+                <span>SVM p_hat 사용</span>
+              </label>
+
+              <label
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  color: "#e2e8f0",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={useTreeSubMode}
+                  onChange={(e) => setUseTreeSubMode(e.target.checked)}
+                />
+                <span>Tree sub_tree 사용</span>
+              </label>
 
               <div style={{ flex: 1, minWidth: 280 }}>
                 <input
@@ -921,7 +1030,7 @@ export default function RehabSimulator_personalized() {
             }}
           >
             <h2 style={{ margin: "0 0 10px 0", fontSize: 18 }}>
-              p(t), EMA, Threshold
+              p(t) used, EMA, Threshold
             </h2>
             <div
               style={{ background: "#0b1220", borderRadius: 10, padding: 10 }}
@@ -938,7 +1047,7 @@ export default function RehabSimulator_personalized() {
                   strokeDasharray="6,6"
                 />
 
-                {/* T_adapt (downsampled) */}
+                {/* T_adapt */}
                 <polyline
                   points={chart.TadaptDS.map(
                     (p) =>
@@ -952,9 +1061,9 @@ export default function RehabSimulator_personalized() {
                   strokeDasharray="6,6"
                 />
 
-                {/* p raw */}
+                {/* p used */}
                 <polyline
-                  points={chart.pRawDS
+                  points={chart.pUsedDS
                     .map(
                       (p) =>
                         `${(p.i / Math.max(1, derived.length - 1)) * 1000},${
@@ -982,7 +1091,7 @@ export default function RehabSimulator_personalized() {
                   strokeWidth={3}
                 />
 
-                {/* current index marker */}
+                {/* current marker */}
                 <line
                   x1={(currentIdx / Math.max(1, derived.length - 1)) * 1000}
                   y1={0}
@@ -1024,9 +1133,18 @@ export default function RehabSimulator_personalized() {
                   fontSize: 14,
                 }}
               >
-                <div style={{ color: "#94a3b8" }}>p(raw)</div>
+                <div style={{ color: "#94a3b8" }}>p used</div>
                 <div>
                   <code>{current.p.toFixed(3)}</code>
+                  <span
+                    style={{ color: "#94a3b8", marginLeft: 8, fontSize: 12 }}
+                  >
+                    (raw p={current.p_raw_in.toFixed(3)}
+                    {current.p_hat !== null
+                      ? `, p_hat=${current.p_hat.toFixed(3)}`
+                      : ", p_hat=NA"}
+                    )
+                  </span>
                 </div>
 
                 <div style={{ color: "#94a3b8" }}>p(EMA)</div>
@@ -1050,22 +1168,6 @@ export default function RehabSimulator_personalized() {
                 <div>
                   <code style={{ color: "#fca5a5" }}>{T_abs.toFixed(3)}</code>
                 </div>
-                <div style={{ color: "#94a3b8" }}>Personal (subject)</div>
-                <div>
-                  {usePersonalThreshold && personalBySubject.get(current.subject) ? (
-                    <code style={{ color: "#a7f3d0" }}>
-                      T_base_user{" "}
-                      {personalBySubject.get(current.subject)!.T_base_user.toFixed(3)}
-                      {" | "}T_min_user{" "}
-                      {personalBySubject.get(current.subject)!.T_min_user.toFixed(3)}
-                      {" | "}sev{" "}
-                      {personalBySubject.get(current.subject)!.severity.toFixed(2)}
-                    </code>
-                  ) : (
-                    <span style={{ color: "#94a3b8" }}>-</span>
-                  )}
-                </div>
-
 
                 <div style={{ color: "#94a3b8" }}>Mode</div>
                 <div>
@@ -1094,6 +1196,11 @@ export default function RehabSimulator_personalized() {
                     }}
                   >
                     {subLabel(gating.sub[currentIdx])}
+                  </span>
+                  <span
+                    style={{ color: "#94a3b8", marginLeft: 8, fontSize: 12 }}
+                  >
+                    (sub_tree={current.sub_tree ?? "NA"})
                   </span>
                 </div>
 
@@ -1133,7 +1240,7 @@ export default function RehabSimulator_personalized() {
               }}
             >
               <h2 style={{ margin: "0 0 10px 0", fontSize: 18 }}>
-                Z-score & Features
+                Z-score & Features (fallback용)
               </h2>
 
               <div
@@ -1191,320 +1298,9 @@ export default function RehabSimulator_personalized() {
                   lineHeight: 1.5,
                 }}
               >
-                원인 분리 우선순위: <b>불안정(Z_inst)</b> → <b>보상(Z_comp)</b>{" "}
-                → <b>과활성(Z_act)</b>
-                <br />
-                (특허 설명의 “불안정 감쇠 우선” 반영)
+                SubMode 결정 우선순위: <b>Tree(sub_tree)</b> 사용(옵션) → 없으면{" "}
+                <b>Z-score 규칙</b> fallback
               </div>
-            </div>
-          </div>
-        )}
-
-        {/* Settings */}
-        {loadOk && (
-          <div
-            style={{
-              background: "#111827",
-              border: "1px solid #334155",
-              padding: 14,
-              borderRadius: 10,
-            }}
-          >
-            <h2 style={{ margin: "0 0 10px 0", fontSize: 18 }}>Settings</h2>
-
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1fr 1fr 1fr",
-                gap: 12,
-              }}
-            >
-              <div
-                style={{ background: "#0b1220", padding: 12, borderRadius: 10 }}
-              >
-                <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                  Threshold
-                </div>
-
-                <label
-                  style={{
-                    display: "flex",
-                    gap: 8,
-                    alignItems: "center",
-                    fontSize: 14,
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={useHealthyPercentile}
-                    onChange={(e) => setUseHealthyPercentile(e.target.checked)}
-                  />
-                  <span>Healthy 95th 사용</span>
-                </label>
-
-                <label
-                  style={{
-                    display: "flex",
-                    gap: 8,
-                    alignItems: "center",
-                    fontSize: 14,
-                    marginTop: 8,
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={usePersonalThreshold}
-                    onChange={(e) => setUsePersonalThreshold(e.target.checked)}
-                  />
-                  <span>개인 임계치(바이오마커) 사용</span>
-                </label>
-
-                <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 6, lineHeight: 1.4 }}>
-                  파일 경로: <code>/public/data/biomarkers_all_subjects.csv</code>,{" "}
-                  <code>/public/data/activation_summary_all_subjects.csv</code>
-                </div>
-
-
-                {!useHealthyPercentile && (
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      marginTop: 8,
-                      fontSize: 14,
-                    }}
-                  >
-                    <span style={{ color: "#94a3b8" }}>T_abs fixed</span>
-                    <input
-                      value={T_abs_fixed}
-                      onChange={(e) => setT_abs_fixed(Number(e.target.value))}
-                      type="number"
-                      step="0.01"
-                      style={{ width: 100 }}
-                    />
-                  </div>
-                )}
-
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 8,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>drop/file</span>
-                  <input
-                    value={dropPerFile}
-                    onChange={(e) => setDropPerFile(Number(e.target.value))}
-                    type="number"
-                    step="1"
-                    style={{ width: 100 }}
-                  />
-                </div>
-              </div>
-
-              <div
-                style={{ background: "#0b1220", padding: 12, borderRadius: 10 }}
-              >
-                <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                  T_adapt (sigmoid)
-                </div>
-
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 6,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>T_base</span>
-                  <input
-                    value={T_base}
-                    onChange={(e) => setT_base(Number(e.target.value))}
-                    type="number"
-                    step="0.01"
-                    style={{ width: 100 }}
-                  />
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 6,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>T_min</span>
-                  <input
-                    value={T_min}
-                    onChange={(e) => setT_min(Number(e.target.value))}
-                    type="number"
-                    step="0.01"
-                    style={{ width: 100 }}
-                  />
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 6,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>k_s</span>
-                  <input
-                    value={k_s}
-                    onChange={(e) => setK_s(Number(e.target.value))}
-                    type="number"
-                    step="1"
-                    style={{ width: 100 }}
-                  />
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 6,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>S_mid</span>
-                  <input
-                    value={S_mid}
-                    onChange={(e) => setS_mid(Number(e.target.value))}
-                    type="number"
-                    step="0.001"
-                    style={{ width: 100 }}
-                  />
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 6,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>alpha(EMA)</span>
-                  <input
-                    value={alpha}
-                    onChange={(e) => setAlpha(Number(e.target.value))}
-                    type="number"
-                    step="0.05"
-                    style={{ width: 100 }}
-                  />
-                </div>
-              </div>
-
-              <div
-                style={{ background: "#0b1220", padding: 12, borderRadius: 10 }}
-              >
-                <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                  Chattering & Z
-                </div>
-
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 6,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>hyst</span>
-                  <input
-                    value={hyst}
-                    onChange={(e) => setHyst(Number(e.target.value))}
-                    type="number"
-                    step="0.01"
-                    style={{ width: 100 }}
-                  />
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginTop: 6,
-                    fontSize: 14,
-                  }}
-                >
-                  <span style={{ color: "#94a3b8" }}>min hold</span>
-                  <input
-                    value={minHoldWindows}
-                    onChange={(e) => setMinHoldWindows(Number(e.target.value))}
-                    type="number"
-                    step="1"
-                    style={{ width: 100 }}
-                  />
-                </div>
-
-                <div
-                  style={{
-                    borderTop: "1px solid #1f2937",
-                    marginTop: 10,
-                    paddingTop: 10,
-                  }}
-                >
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      marginTop: 6,
-                      fontSize: 14,
-                    }}
-                  >
-                    <span style={{ color: "#94a3b8" }}>θ_act</span>
-                    <input
-                      value={theta_act}
-                      onChange={(e) => setThetaAct(Number(e.target.value))}
-                      type="number"
-                      step="0.1"
-                      style={{ width: 100 }}
-                    />
-                  </div>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      marginTop: 6,
-                      fontSize: 14,
-                    }}
-                  >
-                    <span style={{ color: "#94a3b8" }}>θ_comp</span>
-                    <input
-                      value={theta_comp}
-                      onChange={(e) => setThetaComp(Number(e.target.value))}
-                      type="number"
-                      step="0.1"
-                      style={{ width: 100 }}
-                    />
-                  </div>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      marginTop: 6,
-                      fontSize: 14,
-                    }}
-                  >
-                    <span style={{ color: "#94a3b8" }}>θ_inst</span>
-                    <input
-                      value={theta_inst}
-                      onChange={(e) => setThetaInst(Number(e.target.value))}
-                      type="number"
-                      step="0.1"
-                      style={{ width: 100 }}
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div style={{ marginTop: 12, color: "#94a3b8", fontSize: 13 }}>
-              주의: 이 시뮬레이터는 <b>전처리 CSV에 이미 포함된 p</b>를
-              사용합니다(브라우저에서 joblib 추론 없음).
             </div>
           </div>
         )}
