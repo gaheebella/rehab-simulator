@@ -390,12 +390,12 @@ This project was developed for research and educational purposes.
 Please submit bug reports or feature suggestions via issues.
 
 ---
-
+Last Updated: 2026-02-01
 
 ---
 ---
 
-# Design of a Dual-Threshold–Based Personalized Rehabilitation Robot Control System (웹 시뮬레이터)
+# 이중임계치 기반 순환형 개인맞춤 재활로봇 제어시스템 및 방법 (웹 시뮬레이터)
 
 재활 로봇의 적응형 개입 시스템을 시뮬레이션하는 웹 애플리케이션입니다. 머신러닝 기반 위험도 예측과 이중 임계값 시스템을 통해 실시간으로 개입 모드를 결정하고 임피던스 파라미터를 계산합니다.
 
@@ -734,3 +734,6 @@ D_base = D0 + γD * margin
 ## 🤝 기여
 
 버그 리포트나 기능 제안은 이슈로 등록해주세요.
+
+---
+최종 업데이트: 2026-02-01
